@@ -274,7 +274,8 @@ function isHardProxyFailure(errMsg) {
   return hard.some(h => errMsg.includes(h));
 }
 
-async function tryProxy(browser, proxyObj, ua, referer, viewport) {
+// Test proxy directly against SITE_URL — saves data vs extra ipify hop
+async function tryProxy(browser, proxyObj, ua, referer, viewport, targetUrl) {
   try {
     const context = await browser.newContext({
       userAgent: ua, referer, viewport,
@@ -283,10 +284,14 @@ async function tryProxy(browser, proxyObj, ua, referer, viewport) {
     });
     const page = await context.newPage();
     await applyDataSaver(page);
-    // 60s timeout — gives far/slow proxies a fair chance
-    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    const body = await page.textContent('body');
-    console.log(`DIAG: proxy ${proxyObj.label} OK, exit IP =`, body.trim());
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const finalUrl = page.url();
+    console.log(`DIAG: proxy ${proxyObj.label} OK, landed on =`, finalUrl);
+    if (finalUrl.includes('google.com/sorry')) {
+      console.log(`DIAG: proxy ${proxyObj.label} hit CAPTCHA, trying next`);
+      try { await context.close(); } catch (_) {}
+      return { error: 'CAPTCHA', hard: false };
+    }
     return { context, page, label: proxyObj.label };
   } catch (e) {
     const msg = e.message.split('\n')[0];
@@ -301,33 +306,16 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
   let tried = 0;
   let lastError = '';
 
-  // First pass: try every proxy with generous timeout
   for (const proxyObj of shuffled) {
     tried++;
     console.log(`DIAG: trying proxy ${proxyObj.label} (${tried}/${shuffled.length})`);
-    const result = await tryProxy(browser, proxyObj, ua, referer, viewport);
-    if (!result || result.error) {
-      lastError = result && result.error ? result.error : 'proxy unreachable';
-      continue;
-    }
-    try {
-      await result.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const result = await tryProxy(browser, proxyObj, ua, referer, viewport, targetUrl);
+    if (result && !result.error) {
       console.log('DIAG: home url =', result.page.url());
-      if (result.page.url().includes('google.com/sorry')) {
-        console.log('DIAG: CAPTCHA on this proxy, trying next');
-        try { await result.context.close(); } catch (_) {}
-        lastError = 'CAPTCHA';
-        continue;
-      }
       return result;
-    } catch (e) {
-      const msg = e.message.split('\n')[0];
-      console.log('DIAG: target unreachable with this proxy:', msg);
-      lastError = msg;
-      try { await result.page.goto('about:blank', { timeout: 5000 }).catch(() => {}); } catch (_) {}
-      await sleep(500);
-      try { await result.context.close(); } catch (_) {}
     }
+    lastError = result && result.error ? result.error : 'proxy unreachable';
+    try { await sleep(300); } catch (_) {}
   }
 
   console.log('');
