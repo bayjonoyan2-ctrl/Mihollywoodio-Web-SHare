@@ -4,7 +4,6 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
 // ======================= PROXIES FROM SECRET =======================
-// WEBSHARE_PROXIES format: host:port:username:password (one per line)
 function buildProxyListFromEnv() {
   const raw = (process.env.WEBSHARE_PROXIES || '').trim();
   if (!raw) {
@@ -124,19 +123,11 @@ const BROWSE_SITES = [
 // ============ DATA SAVER (ad-aware) ============
 function isAdDomain(url) {
   const adDomains = [
-    'googlesyndication.com',
-    'googleads.g.doubleclick.net',
-    'doubleclick.net',
-    'googletagmanager.com',
-    'google-analytics.com',
-    'adservice.google.com',
-    'googletagservices.com',
-    'pagead2.googlesyndication.com',
-    'tpc.googlesyndication.com',
-    'securepubads.g.doubleclick.net',
-    'amazon-adsystem.com',
-    'adsafeprotected.com',
-    'moatads.com'
+    'googlesyndication.com', 'googleads.g.doubleclick.net', 'doubleclick.net',
+    'googletagmanager.com', 'google-analytics.com', 'adservice.google.com',
+    'googletagservices.com', 'pagead2.googlesyndication.com',
+    'tpc.googlesyndication.com', 'securepubads.g.doubleclick.net',
+    'amazon-adsystem.com', 'adsafeprotected.com', 'moatads.com'
   ];
   return adDomains.some(d => url.includes(d));
 }
@@ -145,16 +136,9 @@ async function applyDataSaver(page) {
   await page.route('**/*', (route) => {
     const type = route.request().resourceType();
     const url = route.request().url();
-
-    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) {
-      return route.abort();
-    }
-    if (type === 'stylesheet' && !isAdDomain(url)) {
-      return route.abort();
-    }
-    if (type === 'image' && !isAdDomain(url)) {
-      return route.abort();
-    }
+    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) return route.abort();
+    if (type === 'stylesheet' && !isAdDomain(url)) return route.abort();
+    if (type === 'image' && !isAdDomain(url)) return route.abort();
     return route.continue();
   });
 }
@@ -250,7 +234,7 @@ async function visitExternalSite(page, label) {
   const site = BROWSE_SITES[rand(0, BROWSE_SITES.length - 1)];
   try {
     console.log(`[${label}] browsing external site:`, site);
-    await page.goto(site, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(site, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await readPage(page, `${label}`, 20, 30);
     if (Math.random() < 0.5) {
       try {
@@ -260,7 +244,7 @@ async function visitExternalSite(page, label) {
         if (links.length) {
           const pick = links[rand(0, links.length - 1)];
           console.log(`[${label}] clicking article:`, pick);
-          await page.goto(pick, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.goto(pick, { waitUntil: 'domcontentloaded', timeout: 60000 });
           await readPage(page, `${label}-article`, 15, 20);
         }
       } catch (e) {
@@ -276,6 +260,20 @@ async function visitExternalSite(page, label) {
   }
 }
 
+// Determine if a proxy error is a HARD failure (dead) vs soft (slow but alive)
+function isHardProxyFailure(errMsg) {
+  const hard = [
+    'ERR_PROXY_AUTH',
+    'ERR_TUNNEL_CONNECTION_FAILED',
+    'ERR_CONNECTION_REFUSED',
+    'ERR_NAME_NOT_RESOLVED',
+    'ERR_INVALID_AUTH_CREDENTIALS',
+    'ERR_SOCKS_CONNECTION_FAILED',
+    '407'
+  ];
+  return hard.some(h => errMsg.includes(h));
+}
+
 async function tryProxy(browser, proxyObj, ua, referer, viewport) {
   try {
     const context = await browser.newContext({
@@ -285,13 +283,16 @@ async function tryProxy(browser, proxyObj, ua, referer, viewport) {
     });
     const page = await context.newPage();
     await applyDataSaver(page);
-    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    // 60s timeout — gives far/slow proxies a fair chance
+    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 60000 });
     const body = await page.textContent('body');
     console.log(`DIAG: proxy ${proxyObj.label} OK, exit IP =`, body.trim());
     return { context, page, label: proxyObj.label };
   } catch (e) {
-    console.log(`DIAG: proxy ${proxyObj.label} FAILED:`, e.message.split('\n')[0]);
-    return null;
+    const msg = e.message.split('\n')[0];
+    const hard = isHardProxyFailure(msg);
+    console.log(`DIAG: proxy ${proxyObj.label} FAILED (${hard ? 'HARD/DEAD' : 'soft/timeout'}):`, msg);
+    return { error: msg, hard };
   }
 }
 
@@ -300,13 +301,17 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
   let tried = 0;
   let lastError = '';
 
+  // First pass: try every proxy with generous timeout
   for (const proxyObj of shuffled) {
     tried++;
     console.log(`DIAG: trying proxy ${proxyObj.label} (${tried}/${shuffled.length})`);
     const result = await tryProxy(browser, proxyObj, ua, referer, viewport);
-    if (!result) { lastError = 'proxy unreachable'; continue; }
+    if (!result || result.error) {
+      lastError = result && result.error ? result.error : 'proxy unreachable';
+      continue;
+    }
     try {
-      await result.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await result.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       console.log('DIAG: home url =', result.page.url());
       if (result.page.url().includes('google.com/sorry')) {
         console.log('DIAG: CAPTCHA on this proxy, trying next');
@@ -316,8 +321,9 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
       }
       return result;
     } catch (e) {
-      console.log('DIAG: target unreachable with this proxy:', e.message.split('\n')[0]);
-      lastError = e.message.split('\n')[0];
+      const msg = e.message.split('\n')[0];
+      console.log('DIAG: target unreachable with this proxy:', msg);
+      lastError = msg;
       try { await result.page.goto('about:blank', { timeout: 5000 }).catch(() => {}); } catch (_) {}
       await sleep(500);
       try { await result.context.close(); } catch (_) {}
@@ -415,7 +421,7 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
   }
 
   try {
-    await page.goto(process.env.SITE_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(process.env.SITE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await readPage(page, 'target-home', 25, 40);
   } catch (e) {
     console.log('homepage goto failed:', e.message.split('\n')[0]);
@@ -437,7 +443,7 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     console.log(`--- article ${i + 1}/${articlesToRead} ---`);
     console.log('reading:', url);
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch (e) {
       console.log('article goto failed:', e.message.split('\n')[0]);
       try { await page.goto('about:blank', { timeout: 5000 }).catch(() => {}); } catch (_) {}
@@ -455,7 +461,7 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     await tryReachAdQuota(`article-${i + 1}`);
     await sleep(rand(10000, 20000));
     try {
-      await page.goto(process.env.SITE_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.goto(process.env.SITE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await readPage(page, 'back-home', 20, 30);
       await tryReachAdQuota(`home-after-article-${i + 1}`);
     } catch (e) {
